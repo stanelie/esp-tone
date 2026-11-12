@@ -1,0 +1,904 @@
+menu "ADPCM Streamer Configuration"
+
+    # ===================================================================
+    #  Audio Parameters
+    # ===================================================================
+
+    menu "Audio"
+
+        choice STREAMER_SAMPLE_RATE
+            prompt "Audio sample rate"
+            default STREAMER_SAMPLE_RATE_16K
+            help
+                I2S capture sample rate. INMP441 supports 8-48 kHz.
+                Higher rates give better quality but use more bandwidth.
+
+        config STREAMER_SAMPLE_RATE_8K
+            bool "8000 Hz"
+        config STREAMER_SAMPLE_RATE_11025
+            bool "11025 Hz"
+        config STREAMER_SAMPLE_RATE_16K
+            bool "16000 Hz"
+        config STREAMER_SAMPLE_RATE_22050
+            bool "22050 Hz"
+        config STREAMER_SAMPLE_RATE_32K
+            bool "32000 Hz"
+        config STREAMER_SAMPLE_RATE_44100
+            bool "44100 Hz"
+        config STREAMER_SAMPLE_RATE_48K
+            bool "48000 Hz"
+        endchoice
+
+        config STREAMER_AUDIO_SAMPLE_RATE
+            int
+            default 8000  if STREAMER_SAMPLE_RATE_8K
+            default 11025 if STREAMER_SAMPLE_RATE_11025
+            default 16000 if STREAMER_SAMPLE_RATE_16K
+            default 22050 if STREAMER_SAMPLE_RATE_22050
+            default 32000 if STREAMER_SAMPLE_RATE_32K
+            default 44100 if STREAMER_SAMPLE_RATE_44100
+            default 48000 if STREAMER_SAMPLE_RATE_48K
+
+        choice STREAMER_I2S_BITS_PER_SAMPLE
+            prompt "I2S bits per sample"
+            default STREAMER_I2S_BITS_24
+            help
+                16-bit: standard mode, simpler processing.
+                24-bit: high resolution, requires TPDF dither for 16-bit output.
+
+        config STREAMER_I2S_BITS_16
+            bool "16-bit"
+        config STREAMER_I2S_BITS_24
+            bool "24-bit"
+        endchoice
+
+        config STREAMER_I2S_BITS_PER_SAMPLE
+            int
+            default 16 if STREAMER_I2S_BITS_16
+            default 24 if STREAMER_I2S_BITS_24
+
+        choice STREAMER_I2S_COMM_FORMAT
+            prompt "I2S communication format"
+            default STREAMER_I2S_FMT_PHILIPS
+            help
+                Philips I2S: standard mode with 1 BCK WS-to-data shift.
+                Most MEMS microphones (INMP441) use this.
+
+        config STREAMER_I2S_FMT_PHILIPS
+            bool "Philips I2S (MSB shift)"
+        config STREAMER_I2S_FMT_LSB
+            bool "LSB (Left-justified, no shift)"
+        endchoice
+
+        config STREAMER_I2S_COMM_FORMAT
+            int
+            default 0 if STREAMER_I2S_FMT_PHILIPS
+            default 1 if STREAMER_I2S_FMT_LSB
+
+        choice STREAMER_AUDIO_CHANNELS
+            prompt "Audio channels"
+            default STREAMER_CHANNELS_LEFT
+            help
+                Mono (left): single INMP441, L/R pin = GND.
+
+        config STREAMER_CHANNELS_LEFT
+            bool "Mono (left channel, L/R=GND)"
+        config STREAMER_CHANNELS_RIGHT
+            bool "Mono (right channel, L/R=VDD)"
+        config STREAMER_CHANNELS_STEREO
+            bool "Stereo (2 channels)"
+        endchoice
+
+        config STREAMER_AUDIO_CHANNELS
+            int
+            default 1 if STREAMER_CHANNELS_LEFT
+            default 1 if STREAMER_CHANNELS_RIGHT
+            default 2 if STREAMER_CHANNELS_STEREO
+
+        config STREAMER_I2S_CHANNEL_FORMAT
+            int
+            default 4 if STREAMER_CHANNELS_LEFT
+            default 3 if STREAMER_CHANNELS_RIGHT
+            default 0 if STREAMER_CHANNELS_STEREO
+
+        choice STREAMER_AUDIO_CODEC
+            prompt "Audio codec (PCM or ADPCM)"
+            default STREAMER_CODEC_ADPCM
+            help
+                ADPCM: DVI4 IMA, 4 bits/sample (32 kbps @ 16kHz), ~10% CPU.
+                PCM: raw 16/24-bit signed, no compression (1536 kbps @ 48kHz/16-bit/stereo).
+                Runtime: AT+CODEC=0|1.
+
+        config STREAMER_CODEC_ADPCM
+            bool "ADPCM (DVI4 IMA, 4 bits/sample)"
+        config STREAMER_CODEC_PCM
+            bool "PCM (raw 16/24-bit, no compression)"
+        endchoice
+
+        config STREAMER_AUDIO_CODEC
+            int
+            default 0 if STREAMER_CODEC_ADPCM
+            default 1 if STREAMER_CODEC_PCM
+
+        choice STREAMER_AUDIO_GAIN
+            prompt "Digital gain"
+            default STREAMER_GAIN_32
+            help
+                Digital gain applied before TPDF dither (both 16-bit and 24-bit).
+                Compensates for INMP441 low sensitivity (-26 dBFS @ 94 dB SPL).
+                Runtime: AT+GAIN (0-64).
+
+        config STREAMER_GAIN_BYPASS
+            bool "Bypass (no gain, 0x)"
+        config STREAMER_GAIN_8
+            bool "+18 dB (8x)"
+        config STREAMER_GAIN_16
+            bool "+24 dB (16x)"
+        config STREAMER_GAIN_32
+            bool "+30 dB (32x) - default"
+        config STREAMER_GAIN_48
+            bool "+34 dB (48x)"
+        config STREAMER_GAIN_64
+            bool "+36 dB (64x)"
+        endchoice
+
+        config STREAMER_AUDIO_GAIN
+            int
+            default 0  if STREAMER_GAIN_BYPASS
+            default 8  if STREAMER_GAIN_8
+            default 16 if STREAMER_GAIN_16
+            default 32 if STREAMER_GAIN_32
+            default 48 if STREAMER_GAIN_48
+            default 64 if STREAMER_GAIN_64
+
+        choice STREAMER_AGC_MODE
+            prompt "AGC mode (preset)"
+            default STREAMER_AGC_VOICE_BALANCED
+            help
+                AGC preset - attack/release speeds, target level, noise gate.
+                Runtime: AT+AGC=0..8.
+
+        config STREAMER_AGC_OFF
+            bool "OFF (use fixed gain)"
+        config STREAMER_AGC_STUDIO_SOFT
+            bool "Studio Soft (very smooth, minimal pumping)"
+        config STREAMER_AGC_PODCAST
+            bool "Podcast (smooth voice control)"
+        config STREAMER_AGC_VOICE_BALANCED
+            bool "Voice Balanced (default, good for speech)"
+        config STREAMER_AGC_VOICE_FAST
+            bool "Voice Fast (fast reaction for dynamic speech)"
+        config STREAMER_AGC_NOISY_ROOM
+            bool "Noisy Room (high noise gate, cuts background)"
+        config STREAMER_AGC_MUSIC
+            bool "Music (slow attack, fast release - no transient squash)"
+        config STREAMER_AGC_LIMITER
+            bool "Limiter (peak limiting only, no quiet boost)"
+        config STREAMER_AGC_SURVEILLANCE
+            bool "Surveillance (aggressive, constant level for monitoring)"
+        endchoice
+
+        config STREAMER_AGC_MODE
+            int
+            default 0 if STREAMER_AGC_OFF
+            default 1 if STREAMER_AGC_STUDIO_SOFT
+            default 2 if STREAMER_AGC_PODCAST
+            default 3 if STREAMER_AGC_VOICE_BALANCED
+            default 4 if STREAMER_AGC_VOICE_FAST
+            default 5 if STREAMER_AGC_NOISY_ROOM
+            default 6 if STREAMER_AGC_MUSIC
+            default 7 if STREAMER_AGC_LIMITER
+            default 8 if STREAMER_AGC_SURVEILLANCE
+
+    endmenu
+
+
+    # ===================================================================
+    #  Audio Transport Mode (top-level)
+    # ===================================================================
+    choice STREAMER_TRANSPORT_MODE
+        prompt "Audio transport mode"
+        default STREAMER_TRANSPORT_UDP
+        help
+            UDP: classic datagram, no delivery/order guarantees.
+            TCP: ESP = listener (server connects), framing [u16 len][hdr 16B][payload].
+            RawTX: broadcast raw WiFi frames (receiver in monitor mode).
+            Runtime: AT+XPORT=0|1|2 (requires HOTRESTART or RST).
+
+    config STREAMER_TRANSPORT_UDP
+        bool "UDP (default)"
+    config STREAMER_TRANSPORT_TCP
+        bool "TCP (ESP = listener, server connects)"
+    config STREAMER_TRANSPORT_RAWTX
+        bool "Raw 802.11 TX (broadcast, monitor mode)"
+    endchoice
+
+    config STREAMER_TRANSPORT_MODE
+        int
+        default 0 if STREAMER_TRANSPORT_UDP
+        default 1 if STREAMER_TRANSPORT_TCP
+        default 2 if STREAMER_TRANSPORT_RAWTX
+
+    config STREAMER_RAWTX_CHANNEL
+        int "WiFi channel for Raw 802.11 TX mode (1-14)"
+        range 1 14
+        default 1
+        help
+            WiFi channel for RawTX broadcasts (2.4 GHz).
+            Receiver must use the same channel in Monitor Mode.
+            Runtime: AT+WCH=1..14 (HOTRESTART to apply).
+
+
+    # ===================================================================
+    #  I2S Timing Delays
+    # ===================================================================
+
+    menu "I2S Timing"
+        config STREAMER_I2S_TIMING_SD_DELAY
+            int "I2S RX SD (data) input delay (0..3)"
+            default 0
+            range 0 3
+            help
+                Delay of DATA (SD) relative to BCK, in APB clock cycles (12.5 ns @ 80 MHz).
+                0 = no delay (default for INMP441 on short wires).
+                1..3 = skew compensation for long wires or unusual PCB layout.
+
+        config STREAMER_I2S_TIMING_WS_DELAY
+            int "I2S RX WS input delay (0..3)"
+            default 0
+            range 0 3
+            help
+                Delay of the WS signal relative to BCK. See SD_DELAY help.
+
+        config STREAMER_I2S_TIMING_BCK_DELAY
+            int "I2S RX BCK input delay (0..3)"
+            default 0
+            range 0 3
+            help
+                Delay of the BCK signal. See SD_DELAY help.
+    endmenu
+
+    # ===================================================================
+    #  Battery & Power
+    # ===================================================================
+
+    menu "Battery Monitoring"
+
+        config STREAMER_BATTERY_ENABLED
+            bool "Enable battery monitoring"
+            default n
+            help
+                Enable battery voltage monitoring via ESP8266 ADC (TOUT pin).
+                Requires an external voltage divider scaling V_batt into 0-1V.
+                Below BATT_CRITICAL_MV -> deep sleep (BATT_SLEEP_MIN min).
+
+        config STREAMER_BATT_CRITICAL_MV
+            int "Critical battery voltage (mV)"
+            depends on STREAMER_BATTERY_ENABLED
+            range 3000 4200
+            default 3700
+            help
+                Below this voltage -> deep sleep to protect battery.
+                Li-Ion: 3700 mV = ~20% charge (safe cutoff).
+
+        config STREAMER_BATT_START_MV
+            int "Startup minimum voltage (mV)"
+            depends on STREAMER_BATTERY_ENABLED
+            range 3000 4200
+            default 3900
+            help
+                Minimum battery voltage for normal startup.
+                Below this on boot -> immediate deep sleep.
+
+        config STREAMER_BATT_BAD_MV
+            int "Invalid reading threshold (mV)"
+            depends on STREAMER_BATTERY_ENABLED
+            range 0 2600
+            default 2500
+            help
+                Below this, ADC reading is considered erroneous (no battery,
+                broken divider). Does NOT trigger deep sleep - just logs warning.
+
+        config STREAMER_BATT_DIVIDER_RATIO
+            int "Voltage divider ratio (x1)"
+            depends on STREAMER_BATTERY_ENABLED
+            range 1000 20000
+            default 5711
+            help
+                Voltage divider coefficient. Formula: V_batt_mV = (ADC_raw × RATIO) / 1024.
+                R1=100k, R2=33k -> 5711. R1=220k, R2=100k -> 4674. Calibrate with multimeter.
+
+        config STREAMER_BATT_ADC_SAMPLES
+            int "ADC sample count"
+            depends on STREAMER_BATTERY_ENABLED
+            range 1 50
+            default 15
+            help
+                Number of ADC readings to average. More = more stable, slower (~50ms per sample).
+
+        config STREAMER_BATT_ADC_DELAY_MS
+            int "ADC sample interval (ms)"
+            depends on STREAMER_BATTERY_ENABLED
+            range 10 200
+            default 50
+            help
+                Delay between ADC samples. Allows ADC to stabilize.
+
+        config STREAMER_BATT_CHECK_MIN
+            int "Battery check interval (minutes)"
+            depends on STREAMER_BATTERY_ENABLED
+            range 1 60
+            default 1
+            help
+                How often the monitor task checks battery voltage.
+
+        config STREAMER_BATT_SLEEP_MIN
+            int "Deep sleep duration (minutes)"
+            depends on STREAMER_BATTERY_ENABLED
+            range 1 1440
+            default 30
+            help
+                Deep sleep duration on critical battery. 1440 = 24 hours.
+
+        config STREAMER_BATT_TASK_STACK
+            int "Battery task stack (bytes)"
+            depends on STREAMER_BATTERY_ENABLED
+            range 512 4096
+            default 1024
+            help
+                Stack size for battery_monitor_task.
+
+        config STREAMER_BATT_TASK_PRIO
+            int "Battery task priority"
+            depends on STREAMER_BATTERY_ENABLED
+            range 1 10
+            default 3
+            help
+                FreeRTOS priority for battery_monitor_task.
+    endmenu
+
+    # ===================================================================
+    #  WiFi Defaults
+    # ===================================================================
+
+    menu "WiFi Defaults"
+
+        config STREAMER_WIFI_SSID
+            string "Default WiFi SSID"
+            default "YOUR_WIFI_SSID"
+            help
+                Default WiFi network name. Runtime: AT+WIFI=ssid,password (auto-saved to NVS).
+
+        config STREAMER_WIFI_PASSWORD
+            string "Default WiFi password"
+            default "12345678"
+            help
+                Default WiFi password. Must be 8-63 characters (WPA2 requirement).
+                Leave EMPTY for open (no-password) networks.
+                Runtime: AT+WIFI=ssid,password or AT+WIFI=ssid (open).
+
+        config STREAMER_WIFI_HOSTNAME
+            string "WiFi hostname"
+            default "esp-streamer"
+            help
+                Device hostname on the network. Max 23 characters (24-byte field w/ NUL).
+                Rejected at runtime by AT+HOST if longer; truncated by the config loader at boot.
+
+        config STREAMER_WIFI_CONNECT_TIMEOUT_MS
+            int "WiFi connection timeout (ms)"
+            range 5000 120000
+            default 15000
+
+        config STREAMER_WIFI_RECONNECT_BACKOFF_MIN_MS
+            int "Minimum WiFi reconnect backoff delay (ms)"
+            range 100 30000
+            default 1000
+
+        config STREAMER_WIFI_RECONNECT_BACKOFF_MAX_MS
+            int "Maximum WiFi reconnect backoff delay (ms)"
+            range 1000 120000
+            default 15000
+            help
+                Lowered from 30000 to 15000 to shrink the DHCP-wedge window
+                (long backoff cycles increase the chance of lwIP DHCP client wedging).
+
+        choice STREAMER_WIFI_PS_MODE_CHOICE
+            prompt "WiFi power-save mode (esp_wifi_set_ps)"
+            default STREAMER_WIFI_PS_MAX_MODEM
+            help
+                Modem power-save mode applied at WIFI_EVENT_STA_START (both the
+                station and the Raw 802.11 TX radio setup).
+
+                NONE      - radio always on. Lowest latency / jitter, highest
+                            current (~70 mA). Best for a mains-powered streamer.
+                MIN_MODEM - sleep between DTIM beacons (wakes every beacon,
+                            DTIM=1). Good compromise for battery operation.
+                MAX_MODEM - sleep according to the AP's DTIM period. Lowest
+                            current, but RX/TX are bunched around DTIM wake-ups,
+                            which shows up as packet-arrival jitter on the
+                            server (buffered by its jitter buffer).
+
+                The previous firmware hard-coded MAX_MODEM; it stays the default
+                so upgrading does not change power consumption.
+
+            config STREAMER_WIFI_PS_NONE
+                bool "NONE (always on, lowest jitter)"
+            config STREAMER_WIFI_PS_MIN_MODEM
+                bool "MIN_MODEM (wake every beacon)"
+            config STREAMER_WIFI_PS_MAX_MODEM
+                bool "MAX_MODEM (wake per DTIM, lowest power)"
+        endchoice
+
+        config STREAMER_WIFI_PS_MODE
+            int
+            default 0 if STREAMER_WIFI_PS_NONE
+            default 1 if STREAMER_WIFI_PS_MIN_MODEM
+            default 2 if STREAMER_WIFI_PS_MAX_MODEM
+            default 2
+
+        config STREAMER_WIFI_DHCP_FALLBACK_MS
+            int "Static IP fallback after DHCP silence (ms, 0 = disabled)"
+            range 0 60000
+            default 8000
+            help
+                After (re)association the device always waits for DHCP first.
+                If no IP_EVENT_STA_GOT_IP arrives within this time and the
+                previous lease was obtained from the SAME access point (BSSID),
+                the last known IP/mask/gateway is applied statically so that
+                streaming can continue when the DHCP server is down.
+
+                While running on the static fallback the device retries DHCP
+                every WIFI_STATIC_REFRESH_MS (10 min, board_wifi.h) when it is
+                not streaming, so the lease is eventually renewed.
+
+                0 disables the fallback completely: DHCP only. The old
+                behaviour (apply the cached IP immediately, DHCP stopped
+                forever, even on a different network) is gone.
+
+    endmenu
+
+    # ===================================================================
+    #  WiFi Boot Retry (deep sleep on connect failure)
+    # ===================================================================
+
+    menu "WiFi Boot Retry"
+
+        config STREAMER_WIFI_BOOT_RETRY_ENABLED
+            bool "Enable WiFi boot retry with deep sleep"
+            default y
+            help
+                On boot, try connecting to the AP multiple times. If all fail,
+                enter deep sleep for a configurable duration, then reboot and retry.
+                Only applies to UDP/TCP transports (RawTX skips AP association).
+                NOTE: deep sleep on ESP8266 requires GPIO16 (XPD_DCDC) to RST.
+
+        config STREAMER_WIFI_BOOT_RETRY_ATTEMPTS
+            int "Number of WiFi connection attempts before sleep"
+            range 1 20
+            default 3
+            depends on STREAMER_WIFI_BOOT_RETRY_ENABLED
+            help
+                Connection attempts before giving up. Each waits WIFI_CONNECT_TIMEOUT_MS
+                (default 15s). 3 attempts = ~45s total before sleep.
+
+        config STREAMER_WIFI_BOOT_SLEEP_MINUTES
+            int "Deep sleep duration after WiFi connect failure (minutes)"
+            range 1 30
+            default 2
+            depends on STREAMER_WIFI_BOOT_RETRY_ENABLED
+            help
+                Sleep duration before reboot-and-retry. 1-2 min for quick recovery;
+                increase to save power on battery.
+
+        config STREAMER_WIFI_BOOT_SLEEP_MODE
+            int "Sleep mode (0=deep sleep, 1=soft sleep vTaskDelay)"
+            range 0 1
+            default 1
+            depends on STREAMER_WIFI_BOOT_RETRY_ENABLED
+            help
+                0 = Deep sleep (esp_deep_sleep): lowest power, requires GPIO16->RST.
+                    On wake, ESP reboots (runs app_main from scratch).
+                1 = Soft sleep (vTaskDelay): no hardware mod, more power.
+                    WiFi reconnect retried in-place (no reboot).
+
+    endmenu
+
+    # ===================================================================
+    #  Service Port (EASSP Protocol)
+    # ===================================================================
+
+    menu "Service Port (EASSP)"
+
+        config STREAMER_SVC_PORT
+            int "EASSP service port"
+            range 1 65535
+            default 3950
+
+        config STREAMER_SVC_WATCHDOG_TIMEOUT_MS
+            int "Server watchdog timeout (ms)"
+            range 3000 120000
+            default 15000
+
+        config STREAMER_SVC_INFO_INTERVAL_MS
+            int "Periodic INFO interval while streaming (ms)"
+            range 100 10000
+            default 1000
+
+        config STREAMER_SVC_ANNOUNCE_ENABLED
+            bool "Enable broadcast announcements when idle"
+            default y
+            help
+                ESP broadcasts INFO packets every 1-5s while idle, allowing servers
+                to discover it automatically. Disable only for security-sensitive
+                deployments where the server must know the device IP in advance.
+
+        config STREAMER_SVC_ANNOUNCE_MIN_MS
+            int "Minimum announce interval (ms)"
+            range 500 30000
+            default 1000
+            depends on STREAMER_SVC_ANNOUNCE_ENABLED
+
+        config STREAMER_SVC_ANNOUNCE_MAX_MS
+            int "Maximum announce interval (ms)"
+            range 1000 60000
+            default 5000
+            depends on STREAMER_SVC_ANNOUNCE_ENABLED
+
+        config STREAMER_SVC_RECV_BUF_SIZE
+            int "EASSP receive buffer size (bytes)"
+            range 64 1024
+            default 256
+
+        config STREAMER_SVC_RECONFIGURE_STOP_TIMEOUT_MS
+            int "Reconfigure: wait for stream stop (ms)"
+            range 500 10000
+            default 2000
+
+    endmenu
+
+    # ===================================================================
+    #  Pipeline / Task Configuration
+    # ===================================================================
+
+    menu "Pipeline & Tasks"
+
+        config STREAMER_TASK_PRIO_I2S
+            int "I2S capture task priority"
+            range 1 15
+            default 5
+            help
+                MUST be highest priority - DMA buffers overflow if starved.
+
+        config STREAMER_TASK_PRIO_ADPCM
+            int "ADPCM encoder task priority"
+            range 1 15
+            default 3
+
+        config STREAMER_TASK_PRIO_UDP
+            int "UDP stream task priority"
+            range 1 15
+            default 2
+
+        config STREAMER_TASK_PRIO_AT
+            int "AT command task priority"
+            range 1 15
+            default 1
+
+        config STREAMER_TASK_PRIO_SVC
+            int "Service port task priority"
+            range 1 15
+            default 2
+
+        config STREAMER_TASK_PRIO_TCP_ACCEPT
+            int "TCP accept task priority"
+            range 1 15
+            default 4
+            help
+                Priority of the background accept() task. Lower than I2S (5),
+                higher than or equal to UDP/SVC (2) to react quickly to new connects.
+
+        config STREAMER_TASK_STACK_I2S
+            int "I2S task stack size (bytes)"
+            range 512 8192
+            default 3584
+
+        config STREAMER_TASK_STACK_ADPCM
+            int "ADPCM task stack size (bytes)"
+            range 512 8192
+            default 2560
+
+        config STREAMER_TASK_STACK_UDP
+            int "UDP task stack size (bytes)"
+            range 512 8192
+            default 3072
+
+        config STREAMER_TASK_STACK_AT
+            int "AT command task stack size (bytes)"
+            range 512 8192
+            default 3584
+
+        config STREAMER_TASK_STACK_SVC
+            int "Service port task stack size (bytes)"
+            range 512 8192
+            default 3584
+
+        config STREAMER_TCP_ACCEPT_TASK_STACK
+            int "TCP accept task stack size (bytes)"
+            default 1024
+            range 512 2048
+            help
+                Stack for the background accept() task. 1024 is enough for
+                accept + setsockopt + logging.
+
+        config STREAMER_STREAM_STOP_TIMEOUT_UDP_MS
+            int "Stream stop timeout for UDP transport (ms)"
+            range 1000 10000
+            default 3000
+            help
+                Max wait for the UDP stream_task_fn to exit on stop_streaming.
+                Must be > UDP_SEND_TIMEOUT_MS so a task blocked in sendto() can
+                return - force-deleting it corrupts lwIP state.
+
+        config STREAMER_STREAM_STOP_TIMEOUT_TCP_MS
+            int "Stream stop timeout for TCP transport (ms)"
+            range 1000 15000
+            default 3000
+            help
+                Max wait for the TCP stream_task_fn to exit on stop_streaming.
+                Must be > TCP_SEND_TIMEOUT_MS so a task blocked in send() can
+                return - force-deleting it corrupts lwIP state.
+
+    endmenu
+
+    # ===================================================================
+    #  AT Command Interface
+    # ===================================================================
+
+    menu "AT Command Interface"
+
+        config STREAMER_AT_CMD_ENABLED
+            bool "Enable AT command interface on UART0"
+            default y
+
+        config STREAMER_UART_BAUD_RATE
+            int "AT command UART baud rate"
+            range 1200 460800
+            default 115200
+            depends on STREAMER_AT_CMD_ENABLED
+
+    endmenu
+
+    # ===================================================================
+    #  Network / UDP
+    # ===================================================================
+
+    menu "Network / UDP / TCP"
+
+        config STREAMER_UDP_RECEIVE_TIMEOUT_MS_ENABLED
+            bool "Enable UDP socket receive timeout"
+            default n
+
+        config STREAMER_UDP_RECEIVE_TIMEOUT_MS
+            int "UDP socket receive timeout (ms)"
+            range 500 2000
+            default 2000
+            depends on STREAMER_UDP_RECEIVE_TIMEOUT_MS_ENABLED
+
+        config STREAMER_UDP_SEND_TIMEOUT_MS_ENABLED
+            bool "Enable UDP socket send timeout"
+            default n
+
+        config STREAMER_UDP_SEND_TIMEOUT_MS
+            int "UDP socket send timeout (ms)"
+            range 500 2000
+            default 2000
+            depends on STREAMER_UDP_SEND_TIMEOUT_MS_ENABLED
+
+        config STREAMER_TCP_SEND_TIMEOUT_MS_ENABLED
+            bool "Enable TCP socket send timeout"
+            default y
+
+        config STREAMER_TCP_SEND_TIMEOUT_MS
+            int "TCP socket send timeout (ms)"
+            default 2000
+            range 500 10000
+            depends on STREAMER_TCP_SEND_TIMEOUT_MS_ENABLED
+
+        config STREAMER_TCP_EAGAIN_MAX_RETRIES
+            int "TCP EAGAIN retries per frame (0 = one send attempt)"
+            range 0 5
+            default 0
+            help
+                Max consecutive EAGAIN/EWOULDBLOCK retries in
+                tcp_stream_send() after the first send attempt. The
+                worst-case client-mutex hold from the EAGAIN path is
+                (RETRIES + 1) x TCP socket send timeout; the build
+                fails (#error in board_config.h) if that exceeds the
+                TCP stream stop timeout.
+
+                0 = exactly one send attempt, no EAGAIN retry (tuned
+                default). Retries beyond the whole-frame send deadline
+                never execute before the deadline closes the client
+                (build emits #warning) - raise the deadline as well if
+                you raise this.
+
+        config STREAMER_TCP_FRAME_SEND_DEADLINE_MS
+            int "TCP whole-frame send deadline (ms)"
+            range 500 15000
+            default 2500
+            help
+                Total wall-clock budget to push ONE complete frame:
+                the sum of all send() calls for the frame, including
+                partial sends and EAGAIN retries. Bounds how long a
+                slow-reader client can keep the TCP client mutex held;
+                on expiry the client connection is closed.
+
+                Constraints (enforced by #error/#warning in
+                board_config.h at build time):
+                - must be > TCP socket send timeout (one full send()
+                  window has to fit inside the deadline);
+                - must be < TCP stream stop timeout (so stop_streaming()
+                  never force-deletes the TX task mid-send);
+                - EAGAIN retries that cannot fit inside the deadline
+                  trigger a #warning (wasted retry budget).
+
+                Note: tcp_stream_deinit()/tcp_stream_close_client()
+                wait for the TCP client mutex for this value + 500 ms.
+
+        config STREAMER_TCP_NODELAY_ENABLED
+            bool "Enable TCP_NODELAY (disable Nagle algorithm)"
+            default y
+            help
+                Sets TCP_NODELAY on client sockets. With Nagle (default), TCP coalesces
+                small writes into larger segments, adding ~40ms latency. For low-latency
+                audio (20ms frames), each frame must be sent immediately. Recommended: ON.
+
+        config STREAMER_TCP_KEEPALIVE_ENABLED
+            bool "Enable TCP keepalive on client sockets"
+            default y
+            help
+                Sends periodic TCP keepalive probes to detect dead connections
+                (crashed server, WiFi drop without FIN). Recommended: ON for streaming.
+
+        config STREAMER_TCP_KEEPIDLE
+            int "TCP keepalive idle (seconds before first probe)"
+            range 1 300
+            default 10
+            depends on STREAMER_TCP_KEEPALIVE_ENABLED
+            help
+                Seconds of idle time before the first keepalive probe. 10s detects
+                a dead server quickly (audio may be silent during AGC noise gate).
+
+        config STREAMER_TCP_KEEPINTVL
+            int "TCP keepalive interval (seconds between probes)"
+            range 1 60
+            default 3
+            depends on STREAMER_TCP_KEEPALIVE_ENABLED
+            help
+                Seconds between consecutive keepalive probes after the first.
+
+        config STREAMER_TCP_KEEPCNT
+            int "TCP keepalive count (failed probes = dead)"
+            range 1 20
+            default 3
+            depends on STREAMER_TCP_KEEPALIVE_ENABLED
+            help
+                Failed probes before declaring connection dead.
+                Total detection time ≈ keepidle + keepcnt × keepintvl (default: 19 s).
+
+        config STREAMER_TCP_LINGER_ENABLED
+            bool "Enable TCP SO_LINGER=0 on client sockets (RST close, skip TIME_WAIT)"
+            default y
+            help
+                Forces RST close instead of FIN, skipping TIME_WAIT entirely.
+                Prevents heap exhaustion during rapid reconnect cycles (each TIME_WAIT
+                PCB holds ~8KB of pbuf memory on ESP8266 lwIP). Appropriate for streaming.
+
+    endmenu
+
+    # ===================================================================
+    #  Supervisor Task (software watchdog)
+    # ===================================================================
+
+    menu "Supervisor Task (software watchdog)"
+
+        config STREAMER_SUPERVISOR_ENABLED
+            bool "Enable supervisor task (software watchdog)"
+            default y
+            help
+                Low-priority task that monitors system health and calls esp_restart()
+                if anything goes wrong. Catches "soft" deadlocks where tasks yield
+                (vTaskDelay, xQueueReceive, sendto) but no useful work happens.
+                Recommended: ON.
+
+        config STREAMER_TASK_STACK_SUPERVISOR
+            int "Supervisor task stack size (bytes)"
+            range 512 4096
+            default 2048
+            depends on STREAMER_SUPERVISOR_ENABLED
+
+        config STREAMER_TASK_PRIO_SUPERVISOR
+            int "Supervisor task priority"
+            range 1 4
+            default 1
+            depends on STREAMER_SUPERVISOR_ENABLED
+            help
+                MUST be low priority (1-2). Supervisor runs when the system is idle -
+                a high-priority supervisor would preempt useful work.
+
+        config STREAMER_SUPERVISOR_MIN_HEAP
+            int "Supervisor minimum free heap (bytes)"
+            range 4096 32768
+            default 15360
+            depends on STREAMER_SUPERVISOR_ENABLED
+            help
+                If free heap drops below this, the supervisor resets the ESP.
+                Normal: ~52KB free. 15KB is the minimum for pools + WiFi + lwIP.
+
+        config STREAMER_SUPERVISOR_STALL_TIMEOUT
+            int "Supervisor pipeline stall timeout (ms)"
+            range 5000 60000
+            default 15000
+            depends on STREAMER_SUPERVISOR_ENABLED
+            help
+                If streaming is active for this long and neither I2S nor TX counters
+                have advanced since the last check, the pipeline is deadlocked -> reset.
+
+        config STREAMER_SUPERVISOR_MIN_STACK
+            int "Supervisor minimum free stack (bytes)"
+            range 64 2048
+            default 256
+            depends on STREAMER_SUPERVISOR_ENABLED
+            help
+                If any pipeline task's stack high-water mark drops below this, reset.
+
+        config STREAMER_SUPERVISOR_CHECK_INTERVAL
+            int "Supervisor check interval (ms)"
+            range 500 10000
+            default 2000
+            depends on STREAMER_SUPERVISOR_ENABLED
+            help
+                How often the supervisor runs its checks. 2s gives fast detection.
+
+    endmenu
+
+    # ===================================================================
+    #  Fine tuning (advanced)
+    # ===================================================================
+
+    menu "Fine tuning (advanced)"
+
+        config STREAMER_MAX_FRAME_MS
+            int "Maximum frame duration (ms, auto-reduced if DRAM is short)"
+            range 5 60
+            default 20
+            help
+                Upper bound for the audio frame duration, i.e. YOUR choice of
+                the latency / overhead trade-off. It is a limit, not a target:
+                at stream start the firmware picks the LARGEST value from
+                {60,50,40,30,25,20,15,10,5} ms that is <= this limit AND
+                satisfies the UDP MTU (1400 B), the DMA minimum, the ADPCM
+                even-sample rule and (RawTX) the air-time budget. If the
+                buffers for that frame cannot be allocated in DRAM, it steps
+                down automatically and logs "Frame duration reduced to N ms".
+
+                The automation only knows whether a frame FITS; what it
+                cannot decide is what you want:
+                  - latency: a frame is buffered completely before it is
+                    sent (plus the pool, plus the receiver's jitter buffer);
+                    50 ms frames add ~30 ms end-to-end over 20 ms and lose
+                    2.5x more audio per dropped packet;
+                  - headroom: the picker stops as soon as two packet pbufs
+                    still fit, so a lower limit is also how you keep spare
+                    DRAM for DHCP renew, the AT console, WiFi retries;
+                  - predictability: with a limit the frame does not depend
+                    on the heap state at stream start.
+
+                Default 20 = the proven 48 kHz configuration, no retries at
+                start. Raise it (e.g. 60) for 8-16 kHz ADPCM if you prefer
+                fewer, larger packets over latency. Note that PCM at high
+                rates is bounded by the MTU anyway (48 kHz/24-bit PCM = 5 ms).
+
+    endmenu
+
+endmenu

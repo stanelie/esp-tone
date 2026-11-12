@@ -1,0 +1,1351 @@
+/* ---- System / SDK includes ---- */
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+/* ---- Project includes ---- */
+#include "board_config.h"
+#include "wifi_sta.h"
+#include "svc_port.h"
+#include "stream_control.h"
+#include "tcp_stream.h"
+/* FIX FR-AT #13: see FIXES.md — stream_mode_current_transport() used by
+ * wifi_sta_reconfigure() to refuse reconfiguration in RawTX mode.
+ * FIX (F3-B #4): config_get_copy() used by wifi_sta_reconfigure() to also
+ * check the NVS-persisted transport (handles pending RawTX switch). */
+#include "stream_mode.h"
+#include "config_mgr.h"
+
+static const char *TAG = "wifi_sta";
+
+#define WIFI_EVT_CONNECTED (1 << 0)
+#define WIFI_EVT_GOT_IP (1 << 1)
+#define WIFI_EVT_STA_STARTED (1 << 2)
+#define WIFI_EVT_RECONNECT_REQ (1 << 3)
+#define WIFI_EVT_EXIT (1 << 4)
+#define WIFI_EVT_APPLY_CACHED (1 << 5)
+
+#define WIFI_EVT_REINIT_SOCKET (1 << 6)
+/* B1 fix: link-layer association state (set on STA_CONNECTED, cleared on
+ * STA_DISCONNECTED). WIFI_EVT_CONNECTED keeps its old meaning "has an IP". */
+#define WIFI_EVT_LINK_UP (1 << 7)
+/* B1 fix: "associated, waiting for DHCP" — the reconnect task arms the
+ * static-IP fallback timer on this bit instead of applying the cache at once. */
+#define WIFI_EVT_DHCP_WAIT (1 << 8)
+
+static EventGroupHandle_t s_wifi_evt = NULL;
+static SemaphoreHandle_t s_backoff_mtx = NULL;
+static uint32_t s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+static bool s_initialized = false;
+static bool s_wifi_hw_initialized = false;
+static char s_hostname[32] = {0}; /* saved for tcpip_adapter_set_hostname in STA_START */
+
+static TaskHandle_t s_reconnect_task = NULL;
+#define RECONNECT_TASK_STACK 2048
+#define RECONNECT_TASK_PRIO 4
+
+static volatile bool s_intentional_disconnect = false;
+
+/* Last DHCP lease. All fields below are protected by s_backoff_mtx.
+ * B1 fix: the lease is bound to the BSSID it was obtained from and is used
+ * ONLY as a fallback when DHCP stays silent after association (see
+ * WIFI_DHCP_FALLBACK_MS), never blindly on every reconnect. */
+static bool s_have_cached_ip = false;
+static tcpip_adapter_ip_info_t s_cached_ip_info;
+static uint8_t s_cached_bssid[6] = {0};
+/* BSSID of the AP we are currently associated with (from STA_CONNECTED). */
+static uint8_t s_link_bssid[6] = {0};
+/* True while the interface runs on the statically applied cached lease
+ * (DHCP client stopped). Cleared by every real GOT_IP. */
+static bool s_static_fallback = false;
+static TickType_t s_static_since = 0;
+
+/* ---- Link recovery (local change) ----
+ * Sometimes the AP drops the station without the station noticing: it still hears broadcasts
+ * (it keeps the group key) and reports itself connected, but everything it SENDS is discarded,
+ * so it is unreachable until rebooted ("blackholed uplink").
+ *
+ * This used to be caught by pinging the gateway and rejoining after a few unanswered pings. That
+ * was unreliable: ICMP to the gateway is a third party that may not exist or may rate-limit pings,
+ * and under ~1 Mbit/s of audio the ping's own send() fails with ENOMEM (errno 12) — the same local
+ * buffer exhaustion the audio hits — which was miscounted as "gateway silent", so the check tore
+ * down a perfectly good link right after every stream (and the rejoin then missed DHCP and fell
+ * back to a cached static IP, leaving the device unreachable).
+ *
+ * The gateway ping is gone. The authoritative "is my uplink alive?" signal is whether the RECEIVER
+ * (the player app) is actually getting the audio we send: the app reports its received-packet count
+ * in each heartbeat, and svc_port rejoins via wifi_sta_force_rejoin() if we keep sending but that
+ * count never advances (see svc_port.c). A truly dead link with no traffic at all is still caught by
+ * the driver's beacon monitor (esp_wifi_set_inactive_time, set on STA_START). */
+void wifi_sta_force_rejoin(const char *why)
+{
+    ESP_LOGW(TAG, "link recovery: %s - rejoining Wi-Fi", why ? why : "unspecified");
+    esp_wifi_disconnect();   /* STA_DISCONNECTED then schedules the reconnect */
+}
+
+/* Map the menuconfig power-save selection to the SDK enum. */
+static wifi_ps_type_t wifi_ps_mode_from_cfg(void)
+{
+    switch (WIFI_PS_MODE_CFG)
+    {
+    case WIFI_PS_MODE_NONE:
+        return WIFI_PS_NONE;
+    case WIFI_PS_MODE_MIN_MODEM:
+        return WIFI_PS_MIN_MODEM;
+    default:
+        return WIFI_PS_MAX_MODEM;
+    }
+}
+
+static const char *wifi_ps_mode_name(wifi_ps_type_t ps)
+{
+    return (ps == WIFI_PS_NONE) ? "NONE" : (ps == WIFI_PS_MIN_MODEM) ? "MIN_MODEM"
+                                                                      : "MAX_MODEM";
+}
+
+/* Forget the cached lease (new credentials / deinit). */
+static void wifi_cache_clear(void)
+{
+    if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, pdMS_TO_TICKS(500)) == pdTRUE)
+    {
+        s_have_cached_ip = false;
+        memset(&s_cached_ip_info, 0, sizeof(s_cached_ip_info));
+        memset(s_cached_bssid, 0, sizeof(s_cached_bssid));
+        s_static_fallback = false;
+        xSemaphoreGive(s_backoff_mtx);
+    }
+    else
+    {
+        s_have_cached_ip = false; /* best-effort */
+        s_static_fallback = false;
+    }
+}
+
+extern esp_err_t wifi_set_user_fixed_rate(uint8_t enable_mask, uint8_t rate);
+#define FIXED_RATE_MASK_STA 0x01
+#define WIFI_RATE_11B 0x03
+
+#define WIFI_TX_POWER_DBM_TO_QDBM(dbm) ((dbm) * 4)
+
+static void wifi_reconnect_task(void *arg);
+
+typedef struct
+{
+    int8_t tx_power_x;
+    volatile esp_err_t config_err;
+} tx_ctx_t;
+
+static tx_ctx_t s_ctx = {0};
+
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t id, void *data)
+{
+    (void)arg;
+    if (base == WIFI_EVENT)
+    {
+        switch (id)
+        {
+
+        case WIFI_EVENT_STA_START:
+            ESP_LOGI(TAG, "WIFI_EVENT_STA_START - connecting...");
+
+            /* Power-save mode from menuconfig (STREAMER_WIFI_PS_MODE). */
+            wifi_ps_type_t ps_mode = wifi_ps_mode_from_cfg();
+            esp_err_t err = esp_wifi_set_ps(ps_mode);
+            if (err != ESP_OK)
+            {
+                ESP_LOGW(TAG, "esp_wifi_set_ps(%s) failed: %s",
+                         wifi_ps_mode_name(ps_mode), esp_err_to_name(err));
+                s_ctx.config_err = err;
+            }
+            else
+            {
+                ESP_LOGI(TAG, "WiFi power save: %s", wifi_ps_mode_name(ps_mode));
+            }
+
+            wifi_country_t country_config = {
+                .cc = "RU",
+                .schan = 1,
+                .nchan = 13,
+                .policy = WIFI_COUNTRY_POLICY_AUTO,
+                .max_tx_power = WIFI_TX_POWER_DBM_TO_QDBM(WIFI_TX_POWER_MAX),
+            };
+
+            err = esp_wifi_set_country(&country_config);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "esp_wifi_set_country failed: %s", esp_err_to_name(err));
+                s_ctx.config_err = err;
+            }
+
+            if (s_ctx.tx_power_x > WIFI_TX_POWER_MAX)
+                s_ctx.tx_power_x = WIFI_TX_POWER_MAX;
+            err = esp_wifi_set_max_tx_power(WIFI_TX_POWER_DBM_TO_QDBM(s_ctx.tx_power_x));
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "esp_wifi_set_max_tx_power failed: %s", esp_err_to_name(err));
+                s_ctx.config_err = err;
+            }
+
+            ESP_LOGI(TAG, "TX power set to %u dBm", (unsigned)s_ctx.tx_power_x);
+
+            err = esp_wifi_set_inactive_time(ESP_IF_WIFI_STA, 10);
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "esp_wifi_set_inactive_time failed: %s", esp_err_to_name(err));
+                s_ctx.config_err = err;
+            }
+
+            /* Set DHCP hostname (for consistency, even in raw mode). */
+            if (s_hostname[0])
+            {
+                err = tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_STA, s_hostname);
+                if (err != ESP_OK)
+                {
+                    ESP_LOGW(TAG, "tcpip_adapter_set_hostname failed: %s", esp_err_to_name(err));
+                    s_ctx.config_err = err;
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "Hostname set to '%s'", s_hostname);
+                }
+            }
+
+            /* FIX (HIGH #8): see FIXES.md */
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_RECONNECT_REQ);
+
+            break;
+
+        case WIFI_EVENT_STA_DISCONNECTED:
+        {
+            wifi_event_sta_disconnected_t *evt = data;
+            /* FIX (LOW #21): see FIXES.md */
+            if (evt == NULL)
+            {
+                ESP_LOGW(TAG, "STA_DISCONNECTED event with NULL data");
+                break;
+            }
+            xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP |
+                                                 WIFI_EVT_LINK_UP | WIFI_EVT_DHCP_WAIT);
+
+            if (streaming_is_active())
+            {
+                ESP_LOGW(TAG, "STA_DISCONNECTED reason %d - stopping stream + reconnect",
+                         evt->reason);
+                streaming_request_stop();
+            }
+            else
+            {
+                ESP_LOGW(TAG, "STA_DISCONNECTED reason %d - reconnect scheduled",
+                         evt->reason);
+            }
+
+            if (s_intentional_disconnect)
+            {
+                s_intentional_disconnect = false;
+                ESP_LOGI(TAG, "  (intentional disconnect - no reconnect this cycle)");
+                break;
+            }
+
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_RECONNECT_REQ);
+            break;
+        }
+
+        case WIFI_EVENT_STA_CONNECTED:
+        {
+            /* B1 fix. Previously the cached lease was applied immediately
+             * (DHCP stopped) on every association — also after AT+WIFI moved
+             * the device to a different network, which left it on a foreign
+             * subnet until reboot, and the lease was never renewed.
+             *
+             * Now: remember the BSSID we associated with, drop the cache if
+             * it belongs to another AP, and always let DHCP run first. The
+             * cache is only applied by the reconnect task if DHCP stays
+             * silent for WIFI_DHCP_FALLBACK_MS (see WIFI_EVT_DHCP_WAIT). */
+            wifi_event_sta_connected_t *cevt = data;
+            bool cache_usable = false;
+
+            if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
+            {
+                if (cevt)
+                    memcpy(s_link_bssid, cevt->bssid, sizeof(s_link_bssid));
+                else
+                    memset(s_link_bssid, 0, sizeof(s_link_bssid));
+
+                if (s_have_cached_ip &&
+                    (!cevt || memcmp(s_cached_bssid, cevt->bssid, sizeof(s_cached_bssid)) != 0))
+                {
+                    ESP_LOGW(TAG, "STA_CONNECTED - different AP than the cached lease, "
+                                  "dropping cached IP " IPSTR,
+                             IP2STR(&s_cached_ip_info.ip));
+                    s_have_cached_ip = false;
+                    memset(&s_cached_ip_info, 0, sizeof(s_cached_ip_info));
+                    memset(s_cached_bssid, 0, sizeof(s_cached_bssid));
+                }
+                s_static_fallback = false;
+                cache_usable = s_have_cached_ip;
+                xSemaphoreGive(s_backoff_mtx);
+            }
+
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_LINK_UP);
+
+            if (cache_usable && WIFI_DHCP_FALLBACK_MS > 0)
+            {
+                ESP_LOGI(TAG, "STA_CONNECTED - waiting for DHCP (static fallback armed, %u ms)",
+                         (unsigned)WIFI_DHCP_FALLBACK_MS);
+                xEventGroupSetBits(s_wifi_evt, WIFI_EVT_DHCP_WAIT);
+            }
+            else
+            {
+                ESP_LOGI(TAG, "STA_CONNECTED - waiting for DHCP");
+            }
+
+            svc_port_reset_watchdog();
+            break;
+        }
+
+        case WIFI_EVENT_STA_AUTHMODE_CHANGE:
+        {
+
+            wifi_event_sta_authmode_change_t *auth = data;
+            if (!auth)
+            {
+                ESP_LOGW(TAG, "STA_AUTHMODE_CHANGE: event data NULL (old SDK?) - ignoring");
+                break;
+            }
+
+            ESP_LOGI(TAG, "STA_AUTHMODE_CHANGE: %d -> %d",
+                     (int)auth->old_mode, (int)auth->new_mode);
+
+            bool old_encrypted = (auth->old_mode != WIFI_AUTH_OPEN &&
+                                  auth->old_mode != WIFI_AUTH_WEP);
+            bool new_encrypted = (auth->new_mode != WIFI_AUTH_OPEN &&
+                                  auth->new_mode != WIFI_AUTH_WEP);
+
+            if (old_encrypted && !new_encrypted)
+            {
+                ESP_LOGW(TAG, "  DOWNGRADE to unencrypted auth mode %d - "
+                              "stopping stream + forcing reconnect",
+                         (int)auth->new_mode);
+
+                if (streaming_is_active())
+                    streaming_request_stop();
+
+                xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+
+                /* FIX (HIGH #8, P2-HIGH #1): see FIXES.md */
+                s_intentional_disconnect = true;
+                xEventGroupSetBits(s_wifi_evt, WIFI_EVT_RECONNECT_REQ);
+            }
+            else if (auth->old_mode != auth->new_mode)
+            {
+
+                ESP_LOGI(TAG, "  encrypted->encrypted transition - stream continues");
+            }
+
+            break;
+        }
+
+        default:
+            break;
+        }
+    }
+    else if (base == IP_EVENT)
+    {
+        if (id == IP_EVENT_STA_GOT_IP)
+        {
+            ip_event_got_ip_t *evt = data;
+            if (evt == NULL)
+            {
+                ESP_LOGW(TAG, "GOT_IP: event data NULL - ignoring");
+                return;
+            }
+            ESP_LOGI(TAG, "GOT_IP: " IPSTR, IP2STR(&evt->ip_info.ip));
+            {
+                /* Local change: show which AP was chosen and how strong it is. */
+                wifi_ap_record_t ap;
+                if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
+                    ESP_LOGI(TAG, "AP " MACSTR " on channel %u, RSSI %d dBm",
+                             MAC2STR(ap.bssid), ap.primary, ap.rssi);
+            }
+
+            /* FIX F-B #2: take a consistent snapshot of the cached IP state
+             * under the mutex — previously s_have_cached_ip and
+             * s_cached_ip_info were read unlocked and could be torn by a
+             * concurrent writer (APPLY_CACHED / deinit). */
+            bool have_cached = false;
+            tcpip_adapter_ip_info_t cached;
+            memset(&cached, 0, sizeof(cached));
+            if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
+            {
+                have_cached = s_have_cached_ip;
+                cached = s_cached_ip_info;
+                xSemaphoreGive(s_backoff_mtx);
+            }
+
+            if ((xEventGroupGetBits(s_wifi_evt) & WIFI_EVT_GOT_IP) && have_cached &&
+                evt->ip_info.ip.addr == cached.ip.addr &&
+                evt->ip_info.gw.addr == cached.gw.addr &&
+                evt->ip_info.netmask.addr == cached.netmask.addr)
+            {
+                ESP_LOGI(TAG, "GOT_IP duplicate (same IP, already processed) - skipping");
+                return;
+            }
+
+            if (have_cached &&
+                evt->ip_info.ip.addr != cached.ip.addr)
+            {
+                ESP_LOGW(TAG, "IP changed: cached " IPSTR " -> new " IPSTR " - restarting stream",
+                         IP2STR(&cached.ip),
+                         IP2STR(&evt->ip_info.ip));
+
+                if (streaming_is_active())
+                    streaming_request_stop();
+                xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+            }
+
+            /* FIX (MEDIUM #30): see FIXES.md — uses the snapshotted cached
+             * value for the same race-safety reason as above. */
+            bool ip_changed = !have_cached ||
+                              (memcmp(&cached, &evt->ip_info,
+                                      sizeof(cached)) != 0);
+
+            /* FIX (HIGH #9): see FIXES.md
+             * B1 fix: the lease is bound to the BSSID of the current
+             * association; a real DHCP answer also ends any static fallback. */
+            if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
+            {
+                s_cached_ip_info = evt->ip_info;
+                s_have_cached_ip = true;
+                memcpy(s_cached_bssid, s_link_bssid, sizeof(s_cached_bssid));
+                s_static_fallback = false;
+                s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+                xSemaphoreGive(s_backoff_mtx);
+            }
+
+            /* DHCP answered — disarm the static fallback timer. */
+            xEventGroupClearBits(s_wifi_evt, WIFI_EVT_DHCP_WAIT);
+
+            if (ip_changed)
+            {
+                xEventGroupSetBits(s_wifi_evt, WIFI_EVT_REINIT_SOCKET);
+            }
+
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+        }
+        else if (id == IP_EVENT_STA_LOST_IP)
+        {
+            /* Lease expired without renewal (DHCP server gone?). Keep the
+             * last address if it came from this very AP (checked in the
+             * reconnect task), otherwise fall back to a reconnect. */
+            ESP_LOGW(TAG, "IP_EVENT_STA_LOST_IP - IP lost, re-applying cached IP");
+            xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+            if (streaming_is_active())
+                streaming_request_stop();
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_APPLY_CACHED);
+        }
+    }
+}
+
+/* B1 fix: apply the cached lease statically — but only if it belongs to the
+ * AP we are associated with right now, and only when the fallback is enabled.
+ * `why` is for the log. Called from the reconnect task only. */
+static void wifi_apply_cached_lease(const char *why)
+{
+    bool have = false;
+    tcpip_adapter_ip_info_t cached;
+    uint8_t cached_bssid[6];
+    uint8_t link_bssid[6];
+
+    memset(&cached, 0, sizeof(cached));
+    memset(cached_bssid, 0, sizeof(cached_bssid));
+    memset(link_bssid, 0, sizeof(link_bssid));
+
+    if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
+    {
+        have = s_have_cached_ip;
+        cached = s_cached_ip_info;
+        memcpy(cached_bssid, s_cached_bssid, sizeof(cached_bssid));
+        memcpy(link_bssid, s_link_bssid, sizeof(link_bssid));
+        xSemaphoreGive(s_backoff_mtx);
+    }
+
+    if (!(xEventGroupGetBits(s_wifi_evt) & WIFI_EVT_LINK_UP))
+    {
+        ESP_LOGI(TAG, "%s: not associated - reconnect path will handle it", why);
+        return;
+    }
+
+    if (!have)
+    {
+        /* FIX FR-AT #10: see FIXES.md — nothing to apply, reconnect so DHCP
+         * retries via the standard connect path. */
+        ESP_LOGW(TAG, "%s: no cached IP - requesting reconnect", why);
+        xEventGroupSetBits(s_wifi_evt, WIFI_EVT_RECONNECT_REQ);
+        return;
+    }
+
+    if (WIFI_DHCP_FALLBACK_MS == 0)
+    {
+        /* Static fallback disabled by menuconfig: DHCP only. */
+        ESP_LOGW(TAG, "%s: static fallback disabled - restarting DHCP", why);
+        esp_err_t dh_err = tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
+        if (dh_err != ESP_OK && dh_err != ESP_ERR_TCPIP_ADAPTER_DHCP_ALREADY_STARTED)
+            ESP_LOGW(TAG, "dhcpc_start failed: %s", esp_err_to_name(dh_err));
+        return;
+    }
+
+    if (memcmp(cached_bssid, link_bssid, sizeof(cached_bssid)) != 0)
+    {
+        ESP_LOGW(TAG, "%s: cached lease is from another AP - not applying, waiting for DHCP", why);
+        return;
+    }
+
+    ESP_LOGW(TAG, "%s: applying cached IP " IPSTR " statically (DHCP silent)",
+             why, IP2STR(&cached.ip));
+    tcpip_adapter_dhcpc_stop(TCPIP_ADAPTER_IF_STA);
+    esp_err_t ip_err = tcpip_adapter_set_ip_info(TCPIP_ADAPTER_IF_STA, &cached);
+    if (ip_err == ESP_OK)
+    {
+        svc_port_update_broadcast();
+        if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
+        {
+            s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+            s_static_fallback = true;
+            s_static_since = xTaskGetTickCount();
+            xSemaphoreGive(s_backoff_mtx);
+        }
+        xEventGroupSetBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+        ESP_LOGI(TAG, "Cached IP applied - GOT_IP signaled (DHCP retry in %u s while idle)",
+                 (unsigned)(WIFI_STATIC_REFRESH_MS / 1000U));
+    }
+    else
+    {
+        ESP_LOGW(TAG, "set_ip_info failed: %s - falling back to DHCP",
+                 esp_err_to_name(ip_err));
+        /* FIX F-B #1: DHCP was stopped above; restart it so the interface
+         * can re-acquire an address instead of being left with no IP. */
+        esp_err_t dh_err = tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
+        if (dh_err != ESP_OK && dh_err != ESP_ERR_TCPIP_ADAPTER_DHCP_ALREADY_STARTED)
+        {
+            ESP_LOGW(TAG, "dhcpc_start fallback failed: %s",
+                     esp_err_to_name(dh_err));
+        }
+    }
+}
+
+/* Reconnect task poll period: the static-fallback timer and the DHCP refresh
+ * are checked on every wake-up; events still wake the task immediately. */
+#define WIFI_TASK_POLL_MS 1000
+
+static void wifi_reconnect_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Reconnect task started");
+
+    /* Tick at which WIFI_EVT_DHCP_WAIT was first seen (0 = not armed). */
+    TickType_t dhcp_wait_since = 0;
+
+    while (s_initialized)
+    {
+        /* FIX (HIGH #2): see FIXES.md
+         * B1 fix: bounded wait instead of portMAX_DELAY so the two timers
+         * below run even when no event arrives. WIFI_EVT_DHCP_WAIT is
+         * deliberately NOT in the mask (it stays set for seconds and would
+         * turn this into a busy loop); it is polled below. */
+        EventBits_t bits = xEventGroupWaitBits(
+            s_wifi_evt,
+            WIFI_EVT_RECONNECT_REQ | WIFI_EVT_APPLY_CACHED |
+                WIFI_EVT_REINIT_SOCKET | WIFI_EVT_EXIT,
+            pdFALSE,
+            pdFALSE,
+            pdMS_TO_TICKS(WIFI_TASK_POLL_MS));
+
+        if (!s_initialized || (bits & WIFI_EVT_EXIT))
+            break;
+
+        /* ---- B1: static-IP fallback timer (armed at STA_CONNECTED) ---- */
+        {
+            const TickType_t fallback_ticks = pdMS_TO_TICKS(WIFI_DHCP_FALLBACK_MS);
+            EventBits_t now_bits = xEventGroupGetBits(s_wifi_evt);
+            if (now_bits & WIFI_EVT_DHCP_WAIT)
+            {
+                TickType_t now = xTaskGetTickCount();
+                if (dhcp_wait_since == 0)
+                    dhcp_wait_since = now ? now : 1;
+                else if ((TickType_t)(now - dhcp_wait_since) >= fallback_ticks)
+                {
+                    xEventGroupClearBits(s_wifi_evt, WIFI_EVT_DHCP_WAIT);
+                    dhcp_wait_since = 0;
+                    if (!(now_bits & WIFI_EVT_GOT_IP))
+                        wifi_apply_cached_lease("DHCP timeout");
+                }
+            }
+            else
+            {
+                dhcp_wait_since = 0;
+            }
+        }
+
+        /* ---- B1: renew the lease while running on the static fallback ---- */
+        {
+            bool do_refresh = false;
+            if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
+            {
+                if (s_static_fallback && !streaming_is_active() &&
+                    (uint32_t)(xTaskGetTickCount() - s_static_since) >= pdMS_TO_TICKS(WIFI_STATIC_REFRESH_MS))
+                {
+                    s_static_fallback = false;
+                    do_refresh = true;
+                }
+                xSemaphoreGive(s_backoff_mtx);
+            }
+            if (do_refresh && (xEventGroupGetBits(s_wifi_evt) & WIFI_EVT_LINK_UP))
+            {
+                ESP_LOGI(TAG, "static fallback: retrying DHCP to renew the lease");
+                xEventGroupClearBits(s_wifi_evt, WIFI_EVT_CONNECTED | WIFI_EVT_GOT_IP);
+                esp_err_t dh_err = tcpip_adapter_dhcpc_start(TCPIP_ADAPTER_IF_STA);
+                if (dh_err != ESP_OK && dh_err != ESP_ERR_TCPIP_ADAPTER_DHCP_ALREADY_STARTED)
+                    ESP_LOGW(TAG, "dhcpc_start (refresh) failed: %s", esp_err_to_name(dh_err));
+                /* If DHCP stays silent again, the fallback re-applies the lease. */
+                xEventGroupSetBits(s_wifi_evt, WIFI_EVT_DHCP_WAIT);
+            }
+        }
+
+        if (bits & WIFI_EVT_REINIT_SOCKET)
+        {
+            xEventGroupClearBits(s_wifi_evt, WIFI_EVT_REINIT_SOCKET);
+            svc_port_update_broadcast();
+            if (svc_port_is_running())
+            {
+                esp_err_t rerr = svc_port_reinit_socket();
+                if (rerr != ESP_OK)
+                    ESP_LOGW(TAG, "svc_port_reinit_socket: %s", esp_err_to_name(rerr));
+            }
+
+            esp_err_t terr = tcp_stream_reinit_listener();
+            if (terr != ESP_OK)
+                ESP_LOGW(TAG, "tcp_stream_reinit_listener: %s", esp_err_to_name(terr));
+
+            /* FIX (CRITICAL #1): see FIXES.md */
+        }
+
+        if (bits & WIFI_EVT_APPLY_CACHED)
+        {
+            /* IP_EVENT_STA_LOST_IP: lease expired while associated. */
+            xEventGroupClearBits(s_wifi_evt, WIFI_EVT_APPLY_CACHED);
+            wifi_apply_cached_lease("LOST_IP");
+        }
+
+        if (bits & WIFI_EVT_RECONNECT_REQ)
+        {
+            xEventGroupClearBits(s_wifi_evt, WIFI_EVT_RECONNECT_REQ);
+
+            /* FIX (HIGH #1, F-B #5): see FIXES.md */
+            if (s_intentional_disconnect)
+            {
+                ESP_LOGI(TAG, "intentional disconnect before reconnect");
+                esp_wifi_disconnect();
+                /* Don't clear s_intentional_disconnect here — the
+                 * STA_DISCONNECTED handler (wifi_event_handler, case
+                 * WIFI_EVENT_STA_DISCONNECTED) will clear it when the event
+                 * fires. The 50ms delay below gives the driver time to
+                 * process the disconnect. */
+                vTaskDelay(pdMS_TO_TICKS(50));
+                /* Safety net (F-B #5): if STA_DISCONNECTED never fires within
+                 * 500ms, clear the flag ourselves so it doesn't stay stuck
+                 * and accidentally suppress a legitimate later disconnect. */
+                if (s_intentional_disconnect)
+                {
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                    if (s_intentional_disconnect)
+                    {
+                        ESP_LOGW(TAG, "intentional_disconnect flag stuck - clearing");
+                        s_intentional_disconnect = false;
+                    }
+                }
+            }
+
+            uint32_t delay_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+            if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
+            {
+                delay_ms = s_backoff_ms;
+                s_backoff_ms <<= 1;
+                if (s_backoff_ms > WIFI_RECONNECT_BACKOFF_MAX_MS)
+                    s_backoff_ms = WIFI_RECONNECT_BACKOFF_MAX_MS;
+                xSemaphoreGive(s_backoff_mtx);
+            }
+
+            ESP_LOGW(TAG, "Reconnect in %u ms", (unsigned)delay_ms);
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            if (!s_initialized)
+                break;
+
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK)
+            {
+                ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+                xEventGroupSetBits(s_wifi_evt, WIFI_EVT_RECONNECT_REQ);
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "Reconnect task exiting");
+    s_reconnect_task = NULL;
+    vTaskDelete(NULL);
+}
+
+typedef struct
+{
+    int8_t tx_power_x;
+    uint8_t channel;
+    volatile esp_err_t config_err;
+} raw_tx_ctx_t;
+
+static raw_tx_ctx_t s_raw_ctx = {0};
+
+static void wifi_raw_event_handler(void *arg, esp_event_base_t base,
+                                   int32_t id, void *data)
+{
+    (void)arg;
+    (void)data;
+    if (base != WIFI_EVENT || id != WIFI_EVENT_STA_START)
+        return;
+
+    ESP_LOGI(TAG, "WIFI_EVENT_STA_START - configuring radio (raw TX mode)");
+
+    /* Power-save mode from menuconfig (STREAMER_WIFI_PS_MODE). */
+    wifi_ps_type_t ps_mode = wifi_ps_mode_from_cfg();
+    esp_err_t err = esp_wifi_set_ps(ps_mode);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(%s) failed: %s",
+                 wifi_ps_mode_name(ps_mode), esp_err_to_name(err));
+        s_raw_ctx.config_err = err;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "WiFi power save: %s", wifi_ps_mode_name(ps_mode));
+    }
+
+    err = esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_set_protocol failed: %s", esp_err_to_name(err));
+        if (s_raw_ctx.config_err == ESP_OK)
+            s_raw_ctx.config_err = err;
+    }
+
+    err = esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_set_bandwidth failed: %s", esp_err_to_name(err));
+        s_raw_ctx.config_err = err;
+    }
+
+    wifi_country_t country_config = {
+        .cc = "JP",
+        .schan = 1,
+        .nchan = 14,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL,
+        .max_tx_power = WIFI_TX_POWER_DBM_TO_QDBM(WIFI_TX_POWER_MAX),
+    };
+
+    err = esp_wifi_set_country(&country_config);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_set_country failed: %s", esp_err_to_name(err));
+        s_raw_ctx.config_err = err;
+    }
+
+    err = esp_wifi_set_channel(s_raw_ctx.channel,
+                               WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_set_channel(%d) failed: %s",
+                 s_raw_ctx.channel, esp_err_to_name(err));
+        s_raw_ctx.config_err = err;
+    }
+    err = wifi_set_user_fixed_rate(FIXED_RATE_MASK_STA, WIFI_RATE_11B);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "wifi_set_user_fixed_rate failed: %s - "
+                      "continuing with default rate",
+                 esp_err_to_name(err));
+        s_raw_ctx.config_err = err;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "Raw TX: protocol=11B, rate=11 Mbps (fixed)");
+    }
+
+    if (s_raw_ctx.tx_power_x > WIFI_TX_POWER_MAX)
+        s_raw_ctx.tx_power_x = WIFI_TX_POWER_MAX;
+    err = esp_wifi_set_max_tx_power(WIFI_TX_POWER_DBM_TO_QDBM(s_raw_ctx.tx_power_x));
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_set_max_tx_power failed: %s", esp_err_to_name(err));
+        s_raw_ctx.config_err = err;
+    }
+
+    ESP_LOGI(TAG, "TX power set to %u dBm", (unsigned)s_raw_ctx.tx_power_x);
+
+    /* Set DHCP hostname (for consistency, even in raw mode). */
+    if (s_hostname[0])
+    {
+        err = tcpip_adapter_set_hostname(TCPIP_ADAPTER_IF_STA, s_hostname);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "tcpip_adapter_set_hostname failed: %s", esp_err_to_name(err));
+            s_raw_ctx.config_err = err;
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Hostname set to '%s'", s_hostname);
+        }
+    }
+
+    if (s_wifi_evt)
+        xEventGroupSetBits(s_wifi_evt, WIFI_EVT_STA_STARTED);
+}
+
+static esp_err_t wifi_hw_init(void)
+{
+    esp_netif_init();
+
+    esp_err_t err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE)
+    {
+        ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    err = esp_wifi_init(&cfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(err));
+        /* FIX (LOW): see FIXES.md */
+        esp_wifi_deinit();
+        return err;
+    }
+
+    /* FIX (MEDIUM): see FIXES.md */
+    s_wifi_hw_initialized = true;
+    return ESP_OK;
+}
+
+/* FIX (HIGH #4): see FIXES.md — memcpy with explicit length to avoid
+ * truncating full-length SSIDs/passwords. */
+static void wifi_sta_set_credentials(wifi_config_t *cfg, const char *ssid,
+                                     const char *password)
+{
+    size_t ssid_len = strlen(ssid);
+    if (ssid_len > sizeof(cfg->sta.ssid))
+        ssid_len = sizeof(cfg->sta.ssid);
+    memcpy(cfg->sta.ssid, ssid, ssid_len);
+    if (ssid_len < sizeof(cfg->sta.ssid))
+        cfg->sta.ssid[ssid_len] = '\0';
+    if (password && password[0])
+    {
+        size_t pwd_len = strlen(password);
+        if (pwd_len > sizeof(cfg->sta.password))
+            pwd_len = sizeof(cfg->sta.password);
+        memcpy(cfg->sta.password, password, pwd_len);
+        if (pwd_len < sizeof(cfg->sta.password))
+            cfg->sta.password[pwd_len] = '\0';
+    }
+    /* else: password stays {0} from wifi_config_t wifi_cfg = {0} → open AP */
+
+    /* Local change: with the default fast scan the station joins the first AP that carries the
+     * SSID, scanning up from channel 1, however weak it is. Where several APs share the SSID,
+     * scan every channel and join the strongest. Costs ~1-2 s per connect. */
+    cfg->sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    cfg->sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+}
+
+/* Poll for reconnect task exit (100 ms granularity). */
+static void await_reconnect_task_exit(uint32_t timeout_ms)
+{
+    for (uint32_t i = 0; i < timeout_ms / 100; i++)
+    {
+        if (s_reconnect_task == NULL)
+            break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+esp_err_t wifi_sta_init(const char *ssid, const char *password,
+                        const char *hostname, uint8_t tx_power)
+{
+    esp_err_t err = ESP_FAIL;
+
+    if (s_initialized)
+    {
+        wifi_sta_deinit();
+    }
+    /* Password may be NULL or empty for open networks. */
+    if (!ssid || !ssid[0])
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!password)
+        password = "";
+    if (!hostname || !hostname[0])
+    {
+        hostname = WIFI_HOSTNAME_DEFAULT;
+    }
+
+    s_wifi_evt = xEventGroupCreate();
+    s_backoff_mtx = xSemaphoreCreateMutex();
+    if (!s_wifi_evt || !s_backoff_mtx)
+    {
+        ESP_LOGE(TAG, "Failed to create event group / mutex");
+        goto fail_init_noinit;
+    }
+    s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+    s_intentional_disconnect = false;
+
+    s_ctx.tx_power_x = tx_power;
+    s_ctx.config_err = ESP_OK;
+
+    err = wifi_hw_init();
+    if (err != ESP_OK)
+        goto fail_init_noinit;
+
+    err = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                     wifi_event_handler, NULL);
+    if (err != ESP_OK)
+        goto fail_init;
+    err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                     wifi_event_handler, NULL);
+    if (err != ESP_OK)
+        goto fail_init;
+    err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP,
+                                     wifi_event_handler, NULL);
+    if (err != ESP_OK)
+        goto fail_init;
+
+    wifi_config_t wifi_cfg = {0};
+    wifi_sta_set_credentials(&wifi_cfg, ssid, password);
+    /* Explicitly set authmode for open networks. */
+    if (!password[0])
+    {
+        wifi_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    }
+
+    /* HIGH #10: check return value of esp_wifi_set_config. */
+    err = esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_cfg);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(err));
+        goto fail_init;
+    }
+
+    /* Save hostname for tcpip_adapter_set_hostname, which is called in
+     * WIFI_EVENT_STA_START handler (netif is ready there; here it returns
+     * ESP_ERR_TCPIP_ADAPTER_IF_NOT_READY). */
+    strncpy(s_hostname, hostname, sizeof(s_hostname) - 1);
+    s_hostname[sizeof(s_hostname) - 1] = '\0';
+
+    /* FIX (CRITICAL #2): see FIXES.md */
+    s_initialized = true;
+
+    /* FIX (MEDIUM #29): see FIXES.md */
+    BaseType_t tr = xTaskCreate(wifi_reconnect_task, "wifi_recon", RECONNECT_TASK_STACK,
+                                NULL, RECONNECT_TASK_PRIO, &s_reconnect_task);
+    if (tr != pdPASS)
+    {
+        ESP_LOGE(TAG, "Failed to create reconnect task");
+        s_reconnect_task = NULL;
+        s_initialized = false;
+        err = ESP_FAIL;
+        goto fail_init;
+    }
+
+    err = esp_wifi_start();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+        s_initialized = false;
+        if (s_wifi_evt)
+            xEventGroupSetBits(s_wifi_evt, WIFI_EVT_EXIT);
+        if (s_reconnect_task)
+        {
+            await_reconnect_task_exit(3000);
+            if (s_reconnect_task)
+            {
+                ESP_LOGW(TAG, "wifi init fail: reconnect task did not exit, force-deleting");
+                vTaskDelete(s_reconnect_task);
+                s_reconnect_task = NULL;
+            }
+        }
+        esp_wifi_stop();
+        esp_wifi_deinit();
+        s_wifi_hw_initialized = false;
+        goto fail_init;
+    }
+
+    memset(&wifi_cfg, 0, sizeof(wifi_cfg));
+
+    /* FIX (MEDIUM #28): see FIXES.md */
+    if (s_ctx.config_err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "wifi config error pending: %s",
+                 esp_err_to_name(s_ctx.config_err));
+    }
+
+    ESP_LOGI(TAG, "WiFi STA initialized (UDP mode), connecting to %s...", ssid);
+    return ESP_OK;
+
+fail_init:
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_LOST_IP, wifi_event_handler);
+    /* FIX (MEDIUM): see FIXES.md */
+    if (s_wifi_hw_initialized)
+    {
+        esp_wifi_deinit();
+        s_wifi_hw_initialized = false;
+    }
+fail_init_noinit:
+    if (s_backoff_mtx)
+    {
+        vSemaphoreDelete(s_backoff_mtx);
+        s_backoff_mtx = NULL;
+    }
+    if (s_wifi_evt)
+    {
+        vEventGroupDelete(s_wifi_evt);
+        s_wifi_evt = NULL;
+    }
+    return err != ESP_OK ? err : ESP_FAIL;
+}
+
+esp_err_t wifi_sta_init_raw(uint8_t channel, uint8_t tx_power)
+{
+    if (s_initialized)
+    {
+        wifi_sta_deinit();
+    }
+    if (channel < 1 || channel > 14)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_wifi_evt = xEventGroupCreate();
+    if (!s_wifi_evt)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_backoff_mtx = xSemaphoreCreateMutex();
+    if (!s_backoff_mtx)
+    {
+        vEventGroupDelete(s_wifi_evt);
+        s_wifi_evt = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_intentional_disconnect = false;
+
+    s_raw_ctx.tx_power_x = tx_power;
+    s_raw_ctx.channel = channel;
+    s_raw_ctx.config_err = ESP_OK;
+
+    esp_err_t err = wifi_hw_init();
+    if (err != ESP_OK)
+        goto fail_raw_init;
+
+    err = esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_START,
+                                     wifi_raw_event_handler, NULL);
+    if (err != ESP_OK)
+        goto fail_raw_init_after_hw;
+
+    err = esp_wifi_start();
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+        goto fail_raw_init_after_handler;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_evt,
+                                           WIFI_EVT_STA_STARTED,
+                                           pdFALSE, pdTRUE,
+                                           pdMS_TO_TICKS(WIFI_RAW_START_TIMEOUT_MS));
+    if (!(bits & WIFI_EVT_STA_STARTED))
+    {
+        ESP_LOGE(TAG, "Timeout (%d ms) waiting for WIFI_EVENT_STA_START "
+                      "(raw TX) - radio did not come up",
+                 WIFI_RAW_START_TIMEOUT_MS);
+        err = ESP_ERR_TIMEOUT;
+        goto fail_raw_init_after_start;
+    }
+
+    if (s_raw_ctx.config_err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Raw TX radio configuration failed: %s",
+                 esp_err_to_name(s_raw_ctx.config_err));
+        err = s_raw_ctx.config_err;
+        goto fail_raw_init_after_start;
+    }
+
+    xEventGroupSetBits(s_wifi_evt, WIFI_EVT_CONNECTED);
+
+    s_initialized = true;
+    ESP_LOGI(TAG, "WiFi initialized (Raw 802.11 TX mode, channel %d, "
+                  "protocol=11B, rate=11 Mbps)",
+             channel);
+    return ESP_OK;
+
+fail_raw_init_after_start:
+    esp_wifi_stop();
+fail_raw_init_after_handler:
+    esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_START,
+                                 wifi_raw_event_handler);
+fail_raw_init_after_hw:
+    esp_wifi_deinit();
+    s_wifi_hw_initialized = false;
+fail_raw_init:
+    if (s_backoff_mtx)
+    {
+        vSemaphoreDelete(s_backoff_mtx);
+        s_backoff_mtx = NULL;
+    }
+    if (s_wifi_evt)
+    {
+        vEventGroupDelete(s_wifi_evt);
+        s_wifi_evt = NULL;
+    }
+    return err;
+}
+
+esp_err_t wifi_sta_deinit(void)
+{
+    if (!s_initialized)
+        return ESP_OK;
+
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_LOST_IP, wifi_event_handler);
+    esp_event_handler_unregister(WIFI_EVENT, WIFI_EVENT_STA_START, wifi_raw_event_handler);
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    s_intentional_disconnect = true;
+
+    /* FIX (LOW #25): see FIXES.md */
+    esp_err_t dc = esp_wifi_disconnect();
+    if (dc != ESP_OK && dc != ESP_ERR_WIFI_NOT_STARTED)
+    {
+        ESP_LOGD(TAG, "esp_wifi_disconnect in deinit: %s (expected in raw mode)",
+                 esp_err_to_name(dc));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    s_initialized = false;
+    if (s_wifi_evt)
+        xEventGroupSetBits(s_wifi_evt, WIFI_EVT_EXIT);
+
+    if (s_reconnect_task)
+    {
+        await_reconnect_task_exit(3000);
+        if (s_reconnect_task)
+        {
+            ESP_LOGW(TAG, "wifi_sta_deinit: reconnect task did not exit, force-deleting");
+            vTaskDelete(s_reconnect_task);
+            s_reconnect_task = NULL;
+        }
+    }
+
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    s_wifi_hw_initialized = false;
+
+    if (s_wifi_evt)
+    {
+        vEventGroupDelete(s_wifi_evt);
+        s_wifi_evt = NULL;
+    }
+    if (s_backoff_mtx)
+    {
+        /* FIX (LOW #24): see FIXES.md */
+        if (xSemaphoreTake(s_backoff_mtx, pdMS_TO_TICKS(500)) == pdTRUE)
+        {
+            s_have_cached_ip = false;
+            memset(&s_cached_ip_info, 0, sizeof(s_cached_ip_info));
+            memset(s_cached_bssid, 0, sizeof(s_cached_bssid));
+            memset(s_link_bssid, 0, sizeof(s_link_bssid));
+            s_static_fallback = false;
+            xSemaphoreGive(s_backoff_mtx);
+            /* Temp-pointer pattern: NULL the global first so any concurrent
+             * reader sees NULL and skips take. Then delete via local. */
+            SemaphoreHandle_t tmp = s_backoff_mtx;
+            s_backoff_mtx = NULL;
+            vSemaphoreDelete(tmp);
+        }
+        else
+        {
+            static uint8_t leak_count = 0;
+            leak_count++;
+            ESP_LOGW(TAG, "backoff mutex held — leaking #%u (UB-safe, reboot to reclaim)",
+                     leak_count);
+            s_have_cached_ip = false;
+            s_backoff_mtx = NULL;
+            /* Если утечек > 3, вероятно системная проблема — ребут */
+            if (leak_count >= 3)
+            {
+                ESP_LOGE(TAG, "Too many mutex leaks — rebooting");
+                vTaskDelay(pdMS_TO_TICKS(500));
+                esp_restart();
+            }
+        }
+    }
+    else
+    {
+        s_have_cached_ip = false;
+        memset(&s_cached_ip_info, 0, sizeof(s_cached_ip_info));
+    }
+    memset(s_cached_bssid, 0, sizeof(s_cached_bssid));
+    memset(s_link_bssid, 0, sizeof(s_link_bssid));
+    s_static_fallback = false;
+    s_intentional_disconnect = false;
+
+    ESP_LOGI(TAG, "WiFi deinitialized");
+    return ESP_OK;
+}
+
+esp_err_t wifi_sta_wait_connected(uint32_t timeout_ms)
+{
+    if (!s_wifi_evt)
+        return ESP_ERR_INVALID_STATE;
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_evt,
+                                           WIFI_EVT_CONNECTED,
+                                           pdFALSE, pdTRUE,
+                                           pdMS_TO_TICKS(timeout_ms));
+    return (bits & WIFI_EVT_CONNECTED) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+bool wifi_sta_is_connected(void)
+{
+    if (!s_wifi_evt)
+        return false;
+    return (xEventGroupGetBits(s_wifi_evt) & WIFI_EVT_CONNECTED) != 0;
+}
+
+void wifi_sta_set_tx_power(uint8_t tx_power)
+{
+    if (tx_power > WIFI_TX_POWER_MAX)
+        tx_power = WIFI_TX_POWER_MAX;
+
+    /* FIX F-B #3: keep the cached tx_power_x in sync so a subsequent
+     * WIFI_EVENT_STA_START (after a reconnect) re-applies the new value.
+     * Both the normal STA and the raw-TX contexts are updated. */
+    s_ctx.tx_power_x = tx_power;
+    s_raw_ctx.tx_power_x = tx_power;
+
+    esp_err_t err = esp_wifi_set_max_tx_power(WIFI_TX_POWER_DBM_TO_QDBM(tx_power));
+    if (err != ESP_OK)
+        ESP_LOGW(TAG, "esp_wifi_set_max_tx_power(%u) failed: %s",
+                 (unsigned)tx_power, esp_err_to_name(err));
+    else
+        ESP_LOGI(TAG, "TX power set to %u dBm", (unsigned)tx_power);
+}
+
+esp_err_t wifi_sta_reconfigure(const char *ssid, const char *password)
+{
+    /* LOW #22: distinguish "invalid argument" from "invalid state". */
+    if (!ssid || !ssid[0])
+        return ESP_ERR_INVALID_ARG;
+    if (!password)
+        password = "";
+    if (!s_initialized)
+        return ESP_ERR_INVALID_STATE;
+
+    /* FIX FR-AT #13 + F3-B #4: see FIXES.md — RawTX mode uses a different
+     * WiFi init path (raw 802.11 frame injection, no STA association).
+     * Reconfigure via esp_wifi_disconnect()/esp_wifi_connect() would corrupt
+     * the raw radio state. Require AT+RST (full reboot) to apply WiFi
+     * credential changes in RawTX mode.
+     *
+     * Check BOTH active transport AND NVS config — user may have saved RawTX
+     * via AT+XPORT=2 but not yet HOTRESTART'd. In that case, active is still
+     * UDP but NVS says RawTX, and reconfigure would break the pending switch. */
+    device_config_t cfg;
+    config_get_copy(&cfg);
+    if (stream_mode_current_transport() == TRANSPORT_MODE_RAWTX ||
+        cfg.transport_mode == TRANSPORT_MODE_RAWTX)
+    {
+        ESP_LOGW(TAG, "reconfigure not supported in RawTX mode (active or NVS) - use AT+RST");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    wifi_config_t wifi_cfg = {0};
+    wifi_sta_set_credentials(&wifi_cfg, ssid, password);
+    if (!password[0])
+    {
+        wifi_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    }
+
+    esp_err_t err = esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_cfg);
+    if (err != ESP_OK)
+        return err;
+
+    /* B1 fix: new credentials may mean a new network — the cached lease
+     * (IP/mask/gateway of the OLD network) must not be re-applied. The BSSID
+     * check in STA_CONNECTED would catch it too, but only if the BSSID
+     * differs; an AP that was re-addressed keeps its BSSID. */
+    wifi_cache_clear();
+    xEventGroupClearBits(s_wifi_evt, WIFI_EVT_DHCP_WAIT);
+
+    if (s_backoff_mtx && xSemaphoreTake(s_backoff_mtx, portMAX_DELAY) == pdTRUE)
+    {
+        s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+        xSemaphoreGive(s_backoff_mtx);
+    }
+    else
+    {
+        s_backoff_ms = WIFI_RECONNECT_BACKOFF_MIN_MS;
+    }
+
+    s_intentional_disconnect = true;
+
+    /* FIX F-B #4: disconnect first to ensure a clean driver state before
+     * applying the new config + connect. The STA_DISCONNECTED event this
+     * generates is suppressed by s_intentional_disconnect (cleared by the
+     * STA_DISCONNECTED handler, with a fallback clear below). */
+    esp_wifi_disconnect();
+    /* Give the driver time to emit STA_DISCONNECTED (which clears the flag).
+     * We wait up to 250ms for the flag to clear; if it doesn't (event never
+     * fired), clear it ourselves so we don't leak it. */
+    for (int i = 0; i < 25 && s_intentional_disconnect; i++)
+        vTaskDelay(pdMS_TO_TICKS(10));
+    if (s_intentional_disconnect)
+    {
+        ESP_LOGW(TAG, "reconfigure: intentional_disconnect not cleared by event - clearing");
+        s_intentional_disconnect = false;
+    }
+
+    err = esp_wifi_connect();
+    /* Clear the flag unconditionally — STA_DISCONNECTED handler also clears it
+     * (defense-in-depth), but we clear here as fallback in case the event
+     * doesn't fire (e.g. connect fails immediately). */
+    s_intentional_disconnect = false;
+
+    memset(&wifi_cfg, 0, sizeof(wifi_cfg));
+
+    return err;
+}
+

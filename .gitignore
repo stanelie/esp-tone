@@ -1,0 +1,37 @@
+# ── Secrets and machine-local config ───────────────────────────────────────────
+# Real Wi-Fi credentials live here; each has a committed *.example alongside it.
+wifi_config.h
+local.properties
+keystore.properties
+*.jks
+*.keystore
+
+# ── Build output ───────────────────────────────────────────────────────────────
+build/
+buildrel/
+.gradle/
+.kotlin/
+DerivedData/
+*.o
+*.a
+
+# firmware/build/ is excluded wholesale: the Arduino sketches compile the Wi-Fi
+# credentials into the image, so those .bin files are not publishable. Rebuild locally.
+
+# ESP-IDF: sdkconfig is generated from sdkconfig.defaults and is machine-specific.
+sdkconfig
+sdkconfig.old
+
+# ── Editors and tooling ────────────────────────────────────────────────────────
+.idea/
+*.iml
+xcuserdata/
+*.xcuserstate
+__pycache__/
+*.pyc
+
+# ── macOS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+
+# nested upstream clone
+ESP8266-WiFi-MICROPHONE/.git-upstream/
