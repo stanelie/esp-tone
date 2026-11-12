@@ -225,3 +225,8 @@ cd ESP8266-WiFi-MICROPHONE && git --git-dir=.git-upstream diff
 ```
 
 Upstream is MIT-licensed; its `LICENSE` is retained in that directory.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The vendored fork in `ESP8266-WiFi-MICROPHONE/` is MIT-licensed
+upstream and keeps its own `LICENSE` file.
